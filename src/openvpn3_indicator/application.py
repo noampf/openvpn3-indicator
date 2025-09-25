@@ -192,6 +192,8 @@ class Application(Gtk.Application):
         self.failed_authentications = set()
         self.session_dialogs = dict()
         self.session_statuses = dict()
+        self.session_auth_urls = dict()
+        self.session_auth_opened = set()
 
         self.multi_indicator = MultiIndicator(f'{APPLICATION_NAME}')
         self.default_indicator = self.multi_indicator.new_indicator()
@@ -322,6 +324,13 @@ class Application(Gtk.Application):
                     dialog.destroy()
                     if session_id not in self.sessions:
                         del self.session_dialogs[session_id]
+            # Cleanup any per-session auth tracking for removed sessions
+            for session_id in list(self.session_auth_urls.keys()):
+                if session_id not in self.sessions:
+                    del self.session_auth_urls[session_id]
+            for session_id in list(self.session_auth_opened):
+                if session_id not in self.sessions:
+                    self.session_auth_opened.remove(session_id)
 
     def get_config_name(self, config_id):
         return self.config_names.get(config_id, DEFAULT_CONFIG_NAME)
@@ -350,6 +359,10 @@ class Application(Gtk.Application):
         if False: #TODO: When does it make sense to allow explicit Connect?
             menu_item = Gtk.MenuItem.new_with_label(gettext.gettext('Connect'))
             menu_item.connect('activate', self.action_session_connect, session_id)
+            menu.append(menu_item)
+        if session_id in self.session_auth_urls:
+            menu_item = Gtk.MenuItem.new_with_label(gettext.gettext('Open Authentication Page'))
+            menu_item.connect('activate', self.action_session_open_auth, session_id)
             menu.append(menu_item)
         if openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CONN_CONNECTED == minor:
             menu_item = Gtk.MenuItem.new_with_label(gettext.gettext('Pause'))
@@ -538,10 +551,39 @@ class Application(Gtk.Application):
                     session.Ready()
                     session.Connect()
                     self.sessions_connected.add(session_id)
+                # Start a short probe looking for web-auth URL hints in status messages (v20 compatibility)
+                self.start_auth_url_probe(session_id)
             except: #TODO: Catch only expected exceptions
                 logging.debug(traceback.format_exc())
+        # Preferred path (newer OpenVPN3): explicit AUTH_URL minor with URL in message
         if openvpn3.StatusMajor.SESSION == major and openvpn3.StatusMinor.SESS_AUTH_URL == minor:
-            self.action_auth_url(None, session_id, message)
+            self.session_auth_urls[session_id] = message
+            if session_id not in self.session_auth_opened:
+                logging.info(f'Auth URL (explicit) detected for {session_id}: {message}')
+                self.session_auth_opened.add(session_id)
+                self.action_auth_url(None, session_id, message)
+        else:
+            # Fallback (older versions): try to extract a URL from the message and open it once per session
+            try:
+                url_match = re.search(r'https?://[^\s]+', message)
+                if url_match:
+                    url = url_match.group(0)
+                    self.session_auth_urls[session_id] = url
+                    if session_id not in self.session_auth_opened:
+                        logging.info(f'Auth URL (fallback) detected for {session_id}: {url}')
+                        self.session_auth_opened.add(session_id)
+                        self.action_auth_url(None, session_id, url)
+            except:
+                logging.debug(traceback.format_exc())
+
+        # When a session ends or disconnects, reset auth tracking for that session
+        if (openvpn3.StatusMajor.SESSION == major and openvpn3.StatusMinor.PROC_STOPPED == minor) or \
+           (openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CONN_DISCONNECTED == minor) or \
+           (openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CONN_DONE == minor):
+            if session_id in self.session_auth_urls:
+                del self.session_auth_urls[session_id]
+            if session_id in self.session_auth_opened:
+                self.session_auth_opened.remove(session_id)
         if openvpn3.StatusMajor.SESSION == major and openvpn3.StatusMinor.PROC_STOPPED == minor:
             pass
         if openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CONN_AUTH_FAILED == minor:
@@ -591,7 +633,63 @@ class Application(Gtk.Application):
         self.notify_session_change(session_id)
 
     def action_auth_url(self, _object, session_id, url):
-        webbrowser.open_new(url)
+        # Prefer opening in an existing Chrome/Chromium window as a new tab.
+        # Fall back to the default browser if Chrome is not available.
+        browsers = ['google-chrome', 'chrome', 'chromium-browser', 'chromium']
+        for b in browsers:
+            try:
+                controller = webbrowser.get(b)
+                logging.info(f'Opening auth URL in {b}: {url}')
+                controller.open_new_tab(url)
+                return
+            except:
+                pass
+        try:
+            logging.info(f'Opening auth URL in default browser: {url}')
+            webbrowser.open_new_tab(url)
+        except:
+            # As a last resort
+            logging.info(f'Opening auth URL (fallback open): {url}')
+            webbrowser.open(url)
+
+    def action_session_open_auth(self, _object, session_id):
+        url = self.session_auth_urls.get(session_id, None)
+        if url:
+            self.action_auth_url(_object, session_id, url)
+
+    def start_auth_url_probe(self, session_id):
+        # Poll for up to ~15 seconds for a URL hidden in status messages
+        if session_id in getattr(self, 'session_auth_probe_handles', {}):
+            return
+        if not hasattr(self, 'session_auth_probe_handles'):
+            self.session_auth_probe_handles = dict()
+        attempts = { 'count': 0 }
+        def tick():
+            if session_id not in self.sessions:
+                return False
+            if session_id in self.session_auth_opened:
+                return False
+            attempts['count'] += 1
+            try:
+                status = self.sessions[session_id].GetStatus()
+                msg = str(status.get('message',''))
+                url_match = re.search(r'https?://[^\s]+', msg)
+                if url_match:
+                    url = url_match.group(0)
+                    self.session_auth_urls[session_id] = url
+                    self.session_auth_opened.add(session_id)
+                    logging.info(f'Auth URL (probe) detected for {session_id}: {url}')
+                    self.action_auth_url(None, session_id, url)
+                    return False
+            except:
+                logging.debug(traceback.format_exc())
+            if attempts['count'] >= 30:
+                logging.debug(f'Auth URL probe finished for {session_id} without URL')
+                return False
+            return True
+        logging.debug(f'Starting auth URL probe for {session_id}')
+        handle = GLib.timeout_add(500, tick)
+        self.session_auth_probe_handles[session_id] = handle
 
     def store_set_credentials(self, config_id, credentials):
         store = self.credential_store[config_id]

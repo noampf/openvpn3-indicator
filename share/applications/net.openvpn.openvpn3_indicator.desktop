@@ -9,3 +9,4 @@ Categories=Utility;Network;
 MimeType=application/x-openvpn-profile;
 StartupNotify=true
 X-GNOME-UsesNotifications=true
+Keywords=VPN;OpenVPN;Indicator;Tray;Network;openvpn3;vpn;
